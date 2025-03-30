@@ -6,7 +6,7 @@ import sys # For exiting script if file not found
 
 # --- Configuration ---
 ROLLING_WINDOW_MONTHS = 3 * 12  # 3 years
-NUM_OUTLIERS_TO_LABEL = 5       # Max number of largest magnitude outliers to label per strategy
+NUM_OUTLIERS_TO_LABEL = 5       # Max number of largest magnitude outliers to label per strategy (for box plot)
 FILE_PATH = 'your_total_return_data.csv' # <<< IMPORTANT: Set this to your data file path
 DATE_COLUMN_NAME = 'Date'                # <<< IMPORTANT: Set this to the name of your date column
 
@@ -25,8 +25,6 @@ def calculate_rolling_returns(total_return_index_df, window):
     Returns:
         pd.DataFrame: DataFrame containing rolling annualized geometric returns (CAGR).
     """
-    # Formula: (End Value / Start Value)^(1 / (Total Periods in Window / Periods Per Year)) - 1
-    # Which simplifies to: (End Value / Start Value)^(Periods Per Year / Total Periods in Window) - 1
     rolling_cagr = (total_return_index_df / total_return_index_df.shift(window))**(12.0/window) - 1
     return rolling_cagr.dropna(how='all')
 
@@ -44,21 +42,11 @@ def calculate_rolling_cagr_over_volatility(total_return_index_df, window):
     Returns:
         pd.DataFrame: DataFrame containing rolling CAGR / Volatility ratios.
     """
-    # Calculate rolling CAGR (Numerator) by calling the dedicated function
     rolling_cagr = calculate_rolling_returns(total_return_index_df, window)
-
-    # Calculate rolling annualized standard deviation of monthly returns (Denominator)
-    monthly_returns = total_return_index_df.pct_change() # Keep first NaN for alignment during rolling std calculation
+    monthly_returns = total_return_index_df.pct_change()
     rolling_annual_std_dev = monthly_returns.rolling(window=window).std() * np.sqrt(12)
-
-    # Calculate CAGR / Volatility Ratio
-    # Pandas aligns the DataFrames by index during division
     rolling_ratio = rolling_cagr / rolling_annual_std_dev
-
-    # Replace potential infinities (due to zero std dev) with NaN
     rolling_ratio.replace([np.inf, -np.inf], np.nan, inplace=True)
-
-    # Drop any rows where the ratio couldn't be calculated (e.g., std_dev was NaN)
     return rolling_ratio.dropna(how='all')
 
 def plot_rolling_metric_boxplot(data_df, title, ylabel, num_outliers_to_label=5):
@@ -81,27 +69,20 @@ def plot_rolling_metric_boxplot(data_df, title, ylabel, num_outliers_to_label=5)
     # Identify and label outliers
     for i, strategy in enumerate(data_df.columns):
         series = data_df[strategy].dropna()
-        if series.empty:
-            continue
+        if series.empty: continue
 
-        q1 = series.quantile(0.25)
-        q3 = series.quantile(0.75)
-        iqr = q3 - q1
-        lower_bound = q1 - 1.5 * iqr
-        upper_bound = q3 + 1.5 * iqr
-
+        q1 = series.quantile(0.25); q3 = series.quantile(0.75); iqr = q3 - q1
+        lower_bound = q1 - 1.5 * iqr; upper_bound = q3 + 1.5 * iqr
         outliers = series[(series < lower_bound) | (series > upper_bound)]
 
         if not outliers.empty:
             median = series.median()
             outlier_magnitudes = (outliers - median).abs()
             largest_outliers = outlier_magnitudes.nlargest(num_outliers_to_label)
-
             for date_index in largest_outliers.index:
                 value = outliers.loc[date_index]
                 date_str = date_index.strftime('%Y-%m')
-                plt.text(i, value, f" {date_str}",
-                         horizontalalignment='left', size='small', color='black')
+                plt.text(i, value, f" {date_str}", horizontalalignment='left', size='small', color='black')
 
     plt.title(title, fontsize=16)
     plt.ylabel(ylabel, fontsize=12)
@@ -109,6 +90,42 @@ def plot_rolling_metric_boxplot(data_df, title, ylabel, num_outliers_to_label=5)
     plt.xticks(rotation=45, ha='right')
     plt.grid(axis='y', linestyle='--', alpha=0.7)
     plt.tight_layout()
+
+# --- NEW FUNCTION ---
+def plot_rolling_metric_timeseries(data_df, title, ylabel):
+    """
+    Creates a time series line plot for rolling metrics for multiple strategies.
+
+    Args:
+        data_df (pd.DataFrame): DataFrame containing the rolling metric values
+                                with datetime index. Columns are strategies.
+        title (str): The title for the plot.
+        ylabel (str): The label for the y-axis.
+    """
+    if data_df is None or data_df.empty:
+        print(f"No data to plot for '{title}'. Skipping plot.")
+        return
+
+    plt.figure(figsize=(12, 6)) # Adjust figure size as needed
+    ax = plt.gca() # Get current axes
+
+    for strategy in data_df.columns:
+        ax.plot(data_df.index, data_df[strategy], label=strategy)
+
+    plt.title(title, fontsize=16)
+    plt.ylabel(ylabel, fontsize=12)
+    plt.xlabel("Date", fontsize=12)
+
+    # Add legend - adjust position if it overlaps data
+    # Consider 'best', 'upper left', 'center left', 'bbox_to_anchor' for placement
+    plt.legend(loc='best', fontsize='small')
+    # Example for placing legend outside:
+    # plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', borderaxespad=0., fontsize='small')
+
+
+    plt.grid(axis='both', linestyle='--', alpha=0.7) # Grid on both axes
+    plt.xticks(rotation=0, ha='center') # Adjust rotation if needed
+    plt.tight_layout() # Adjust layout (may need adjustment if legend is outside)
 
 # --- Main Analysis ---
 
@@ -149,18 +166,15 @@ df_filtered = df[strategies_to_analyze]
 print(f"\nCalculating {ROLLING_WINDOW_MONTHS}-Month Rolling Annualized Returns (CAGR)...")
 rolling_returns_plot = calculate_rolling_returns(df_filtered, ROLLING_WINDOW_MONTHS)
 
-# Calculate the CAGR / Volatility Ratio (labeled as Information Ratio)
-# Renamed function for clarity
 print(f"\nCalculating {ROLLING_WINDOW_MONTHS}-Month Rolling Information Ratio (CAGR/Volatility)...")
 rolling_cagr_vol_ratio = calculate_rolling_cagr_over_volatility(df_filtered, ROLLING_WINDOW_MONTHS)
-# Use the desired label "Information Ratio" for display, noting calculation method
 metric_name_display = "Information Ratio"
 calculation_method = "(CAGR/Vol)" # For clearer labeling on plots
 
 # 4. Plotting
 print("\nGenerating plots...")
 
-# Plot Rolling Returns (CAGR)
+# Plot 1: Rolling Returns (CAGR) - Box Plot
 plot_rolling_metric_boxplot(
     data_df=rolling_returns_plot,
     title=f'{ROLLING_WINDOW_MONTHS//12}-Year Rolling Annualized Returns (CAGR)',
@@ -168,15 +182,22 @@ plot_rolling_metric_boxplot(
     num_outliers_to_label=NUM_OUTLIERS_TO_LABEL
 )
 
-# Plot Rolling CAGR / Volatility Ratio (labeled as Information Ratio)
+# Plot 2: Rolling Information Ratio (CAGR/Vol) - Box Plot
 plot_rolling_metric_boxplot(
     data_df=rolling_cagr_vol_ratio,
-    title=f'{ROLLING_WINDOW_MONTHS//12}-Year Rolling {metric_name_display} {calculation_method}',
-    ylabel=f'{metric_name_display} {calculation_method}', # Label includes calculation method
+    title=f'{ROLLING_WINDOW_MONTHS//12}-Year Rolling {metric_name_display} {calculation_method} - Distribution', # Added '- Distribution'
+    ylabel=f'{metric_name_display} {calculation_method}',
     num_outliers_to_label=NUM_OUTLIERS_TO_LABEL
 )
 
-# Show the plots
+# Plot 3: Rolling Information Ratio (CAGR/Vol) - Time Series Plot
+plot_rolling_metric_timeseries(
+    data_df=rolling_cagr_vol_ratio,
+    title=f'{ROLLING_WINDOW_MONTHS//12}-Year Rolling {metric_name_display} {calculation_method} - Time Series', # Added '- Time Series'
+    ylabel=f'{metric_name_display} {calculation_method}'
+)
+
+# Show all generated plots
 plt.show()
 
 print("\nAnalysis Complete.")

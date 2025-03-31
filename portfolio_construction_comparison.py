@@ -35,7 +35,7 @@ class PortfolioConstructor:
     Contribution (ERC), and Hierarchical Risk Parity (HRP) methods based on
     monthly Total Return Index (TRI) data.
 
-    Calculates weights and resulting monthly portfolio returns, handling lookahead bias.
+    Allows specifying different rebalancing frequencies for weight recalculation.
 
     Attributes:
         returns_df: DataFrame of monthly returns for the underlying assets, derived
@@ -98,11 +98,12 @@ class PortfolioConstructor:
         Internal method to calculate monthly portfolio returns from asset returns
         and calculated weights, ensuring lookahead bias is avoided.
 
-        Results are stored in `self.weights` and `self.returns`.
+        Crucially, uses forward-fill (`ffill`) to apply the last known weights
+        between rebalance dates specified in weights_df.
 
         Args:
             method_name: Name of the portfolio construction method (e.g., 'EW').
-            weights_df: DataFrame of portfolio weights, indexed by rebalance dates.
+            weights_df: DataFrame of portfolio weights, indexed ONLY by rebalance dates.
                         These are the target weights decided *at* the index date.
         """
         if weights_df.empty:
@@ -112,14 +113,23 @@ class PortfolioConstructor:
              return
 
         # Align weights to full return series index, forward filling between rebalances
-        # Ensure weights_df index is compatible with returns_df index
+        # This is where holding between infrequent rebalances is handled.
         try:
              aligned_weights = weights_df.reindex(self.returns_df.index).ffill()
+             # Handle potential NaNs at the beginning before the first weight date
+             first_valid_weight_idx = aligned_weights.first_valid_index()
+             if first_valid_weight_idx is not None:
+                 aligned_weights = aligned_weights.loc[first_valid_weight_idx:]
+                 # Reindex again to ensure it matches returns_df after slicing start
+                 aligned_weights = aligned_weights.reindex(self.returns_df.index).ffill()
+             else: # Should not happen if weights_df is not empty, but safeguard
+                 print(f"Warning: Could not find valid weights after aligning for {method_name}.")
+                 aligned_weights = pd.DataFrame(0.0, index=self.returns_df.index, columns=self.tickers) # Assign zero weights
+
         except Exception as e:
              print(f"Error aligning weights for {method_name}: {e}")
              print("Weights Index:", weights_df.index)
              print("Returns Index:", self.returns_df.index)
-             # Handle error appropriately, e.g., return or raise
              self.weights[method_name] = pd.DataFrame(columns=self.tickers)
              self.returns[method_name] = pd.Series(dtype=float, name=method_name)
              return
@@ -142,34 +152,29 @@ class PortfolioConstructor:
         # Calculate portfolio returns: Sum of (weight * asset return)
         # Ensure columns match between shifted_weights and returns_df
         common_tickers = self.returns_df.columns.intersection(shifted_weights.columns)
+        # Align returns_df to shifted_weights index to handle potential start date mismatches
+        aligned_returns, aligned_shifted_weights = self.returns_df.align(shifted_weights, join='inner', axis=0)
+
+        if aligned_returns.empty or aligned_shifted_weights.empty:
+            print(f"Warning: No overlapping dates found between returns and shifted weights for {method_name}. Cannot calculate returns.")
+            self.weights[method_name] = pd.DataFrame(columns=self.tickers)
+            self.returns[method_name] = pd.Series(dtype=float, name=method_name)
+            return
+
         if len(common_tickers) != self.num_assets:
              print(f"Warning: Mismatch in tickers for {method_name} return calculation.")
-             # Decide how to handle: use common tickers, error out, etc.
-             # Using common tickers here:
-             portfolio_returns = (shifted_weights[common_tickers] * self.returns_df[common_tickers]).sum(axis=1)
+             portfolio_returns = (aligned_shifted_weights[common_tickers] * aligned_returns[common_tickers]).sum(axis=1)
         else:
-             portfolio_returns = (shifted_weights * self.returns_df).sum(axis=1)
+             portfolio_returns = (aligned_shifted_weights * aligned_returns).sum(axis=1)
 
 
         # Filter results to start only when weights were first available
-        first_valid_weight_date = weights_df.index.min()
-        # Ensure first_valid_weight_date exists in portfolio_returns index
-        if first_valid_weight_date not in portfolio_returns.index:
-             # Find the first date in portfolio_returns >= first_valid_weight_date
-             potential_start_dates = portfolio_returns.index[portfolio_returns.index >= first_valid_weight_date]
-             if not potential_start_dates.empty:
-                 first_valid_weight_date = potential_start_dates.min()
-             else:
-                 print(f"Warning: No return data available on or after first weight date for {method_name}. Cannot calculate returns.")
-                 self.weights[method_name] = pd.DataFrame(columns=self.tickers)
-                 self.returns[method_name] = pd.Series(dtype=float, name=method_name)
-                 return
-
-        portfolio_returns = portfolio_returns.loc[first_valid_weight_date:]
+        # Use the index from the calculated portfolio_returns which is already aligned
+        first_calc_date = portfolio_returns.index.min()
 
         # Store the actual weights *used* for the calculation period (i.e., the shifted weights)
-        # Drop rows where all weights are NaN (typically the first row after shift)
-        effective_weights = shifted_weights.loc[first_valid_weight_date:].dropna(axis=0, how='all')
+        # Use the aligned index
+        effective_weights = aligned_shifted_weights.loc[first_calc_date:].dropna(axis=0, how='all')
         self.weights[method_name] = effective_weights
 
         # Store the calculated portfolio returns (dropna removes initial NaN from shift if any remain)
@@ -182,7 +187,9 @@ class PortfolioConstructor:
             print(f"No returns were calculated for {method_name} (check data length vs lookback and alignment).")
 
     def construct_equal_weight(self) -> None:
-        """Constructs an Equal Weight (EW) portfolio (1/N weight per asset)."""
+        """Constructs an Equal Weight (EW) portfolio (1/N weight per asset).
+           EW weights are constant and don't require recalculation based on lookback.
+        """
         method_name = "EW"
         print(f"\nConstructing {method_name} portfolio...")
         if self.num_assets == 0:
@@ -192,28 +199,34 @@ class PortfolioConstructor:
         weight_value = 1.0 / self.num_assets
         weights = pd.Series(weight_value, index=self.tickers)
 
-        # Create DataFrame of weights matching the returns index for calculation
-        # Use the actual dates from returns_df for the index
-        weights_df = pd.DataFrame(np.tile(weights.values, (len(self.returns_df.index), 1)),
-                                  index=self.returns_df.index,
-                                  columns=self.tickers)
+        # Create DataFrame of weights. Since EW is constant, we only need the first date.
+        # _calculate_portfolio_returns will forward fill it.
+        first_date = self.returns_df.index.min()
+        weights_df = pd.DataFrame([weights.values], index=[first_date], columns=self.tickers)
 
         self._calculate_portfolio_returns(method_name, weights_df)
         print(f"{method_name} construction complete.")
 
-    def construct_equal_volatility(self, lookback_years: int = 2) -> None:
+    def construct_equal_volatility(self,
+                                   lookback_years: int = 2,
+                                   rebalance_freq_months: int = 1) -> None:
         """
         Constructs an Equal Volatility (EV) portfolio. Weights are inversely
         proportional to each asset's rolling annualized volatility.
 
         Args:
             lookback_years: Lookback period in years for volatility calculation.
+            rebalance_freq_months: Frequency (in months) for recalculating weights (e.g., 1 for monthly, 12 for annual).
         """
-        method_name = "EV"
-        print(f"\nConstructing {method_name} portfolio (Lookback: {lookback_years} years)...")
+        base_method_name = "EV"
+        # Add frequency to name if not monthly
+        freq_suffix = f"_{rebalance_freq_months}M" if rebalance_freq_months > 1 else ""
+        method_name = f"{base_method_name}{freq_suffix}"
+        print(f"\nConstructing {method_name} portfolio (Lookback: {lookback_years} years, Rebalance: {rebalance_freq_months} months)...")
 
         # Validate lookback period
         if lookback_years <= 0: raise ValueError("Lookback years must be positive.")
+        if rebalance_freq_months <= 0: raise ValueError("Rebalance frequency must be positive.")
         lookback_window = int(lookback_years * 12)
         min_lookback_required = 2 # Need >= 2 points for std dev
         if lookback_window < min_lookback_required: raise ValueError(f"Lookback window must be >= {min_lookback_required} months.")
@@ -226,39 +239,43 @@ class PortfolioConstructor:
             print(f"Warning: Not enough data for lookback {lookback_window}. Cannot construct {method_name}."); return
 
         first_calc_date = self.returns_df.index[first_calc_date_index]
+        first_calc_loc = self.returns_df.index.get_loc(first_calc_date) # Get location of first calc date
 
         # Iterate through dates where lookback is available
         for date in self.returns_df.loc[first_calc_date:].index:
-            # Get data slice for lookback ending at current date 't'
             current_loc = self.returns_df.index.get_loc(date)
-            start_loc = current_loc - lookback_window + 1
-            returns_slice = self.returns_df.iloc[start_loc : current_loc + 1]
+            # Check if it's a rebalance month based on frequency
+            months_since_start = current_loc - first_calc_loc
+            if months_since_start % rebalance_freq_months == 0:
+                # Get data slice for lookback ending at current date 't'
+                start_loc = current_loc - lookback_window + 1
+                returns_slice = self.returns_df.iloc[start_loc : current_loc + 1]
 
-            # Check if slice has enough data points after potential NaNs
-            if returns_slice.dropna().shape[0] < min_lookback_required:
-                 print(f"Warning [{date.date()}]: Insufficient non-NaN data points in lookback window for EV. Skipping.")
-                 continue # Skip this date if not enough data
+                # Check if slice has enough data points after potential NaNs
+                if returns_slice.dropna().shape[0] < min_lookback_required:
+                     print(f"Warning [{date.date()}]: Insufficient non-NaN data points in lookback window for EV. Skipping rebalance.")
+                     continue # Skip this rebalance date if not enough data
 
-            # Calculate annualized volatility (std dev * sqrt(12))
-            rolling_vol = returns_slice.std(ddof=1) * ANNUALIZATION_FACTOR_VOL # ddof=1 for sample std dev
+                # Calculate annualized volatility (std dev * sqrt(12))
+                rolling_vol = returns_slice.std(ddof=1) * ANNUALIZATION_FACTOR_VOL # ddof=1 for sample std dev
 
-            # Handle near-zero volatility to avoid division by zero
-            rolling_vol = rolling_vol.fillna(SMALL_VOL_THRESHOLD) # Fill NaN std dev (e.g., constant returns)
-            rolling_vol[rolling_vol.abs() < SMALL_VOL_THRESHOLD] = SMALL_VOL_THRESHOLD
+                # Handle near-zero volatility to avoid division by zero
+                rolling_vol = rolling_vol.fillna(SMALL_VOL_THRESHOLD) # Fill NaN std dev (e.g., constant returns)
+                rolling_vol[rolling_vol.abs() < SMALL_VOL_THRESHOLD] = SMALL_VOL_THRESHOLD
 
-            # Calculate inverse volatility weights: w_i = (1/vol_i) / sum(1/vol_j)
-            inv_vol = 1.0 / rolling_vol
-            weights = inv_vol / (inv_vol.sum() + FLOAT_COMPARISON_THRESHOLD) # Add epsilon for safety
-            # Re-normalize for safety (handles potential float precision issues)
-            weights = weights / (weights.sum() + FLOAT_COMPARISON_THRESHOLD)
-            weights_dict[date] = weights
+                # Calculate inverse volatility weights: w_i = (1/vol_i) / sum(1/vol_j)
+                inv_vol = 1.0 / rolling_vol
+                weights = inv_vol / (inv_vol.sum() + FLOAT_COMPARISON_THRESHOLD) # Add epsilon for safety
+                # Re-normalize for safety (handles potential float precision issues)
+                weights = weights / (weights.sum() + FLOAT_COMPARISON_THRESHOLD)
+                weights_dict[date] = weights # Store weights only for rebalance dates
 
         if not weights_dict:
              print(f"Warning: No weights were calculated for {method_name}."); return
 
-        # Create DataFrame and calculate portfolio returns
+        # Create DataFrame (will only contain rows for rebalance dates)
         weights_df = pd.DataFrame.from_dict(weights_dict, orient='index', columns=self.tickers)
-        weights_df.fillna(0, inplace=True) # Fill any gaps if dates were skipped
+        weights_df.fillna(0, inplace=True) # Should not be needed if calculation skips, but safe
 
         self._calculate_portfolio_returns(method_name, weights_df)
         print(f"{method_name} construction complete.")
@@ -320,16 +337,6 @@ class PortfolioConstructor:
             # Matrix is not PSD, add jitter
             print(f"Warning [{calculation_date.date()}]: Covariance matrix not PSD. Adding diagonal jitter.")
             cov_matrix_values += np.eye(self.num_assets) * COV_MATRIX_JITTER
-            # Optional: Re-check after jittering, though usually not necessary
-            # try:
-            #     np.linalg.cholesky(cov_matrix_values)
-            # except np.linalg.LinAlgError:
-            #     print(f"ERROR [{calculation_date.date()}]: Matrix still not PSD after jittering!")
-            #     # Decide how to handle: raise error, return EW, etc.
-            #     # Returning EW as per fallback logic below
-            #     w0 = np.ones(self.num_assets) / self.num_assets
-            #     return pd.Series(w0, index=self.tickers)
-
 
         # --- Optimization Setup ---
         w0 = np.ones(self.num_assets) / self.num_assets
@@ -381,7 +388,10 @@ class PortfolioConstructor:
             print(f"Warning [{calculation_date.date()}]: ERC optimization failed: {result.message}. Falling back to EW.")
             return pd.Series(w0, index=self.tickers) # Return EW weights
 
-    def construct_erc(self, lookback_years: int = 2, use_ewm: bool = True) -> None:
+    def construct_erc(self,
+                      lookback_years: int = 2,
+                      use_ewm: bool = True,
+                      rebalance_freq_months: int = 1) -> None:
         """
         Constructs an Equal Risk Contribution (ERC) portfolio using optimization.
 
@@ -389,12 +399,18 @@ class PortfolioConstructor:
             lookback_years: Lookback period in years for covariance calculation.
             use_ewm: If True, use Exponentially Weighted Moving Covariance;
                      otherwise, use Simple Moving Covariance.
+            rebalance_freq_months: Frequency (in months) for recalculating weights (e.g., 1 for monthly, 12 for annual).
         """
-        method_name = f"ERC_{'EWM' if use_ewm else 'Simple'}"
-        print(f"\nConstructing {method_name} portfolio (Lookback: {lookback_years} years)...")
+        base_method_name = f"ERC_{'EWM' if use_ewm else 'Simple'}"
+        # Add frequency to name if not monthly
+        freq_suffix = f"_{rebalance_freq_months}M" if rebalance_freq_months > 1 else ""
+        method_name = f"{base_method_name}{freq_suffix}"
+        print(f"\nConstructing {method_name} portfolio (Lookback: {lookback_years} years, Rebalance: {rebalance_freq_months} months)...")
+
 
         # Validate lookback period
         if lookback_years <= 0: raise ValueError("Lookback years must be positive.")
+        if rebalance_freq_months <= 0: raise ValueError("Rebalance frequency must be positive.")
         lookback_window = int(lookback_years * 12)
         # Need at least N+1 points for a non-singular covariance matrix
         min_lookback_required = self.num_assets + 1
@@ -411,77 +427,67 @@ class PortfolioConstructor:
             print(f"Warning: Not enough data for lookback {lookback_window}. Cannot construct {method_name}."); return
 
         first_calc_date = self.returns_df.index[first_calc_date_index]
+        first_calc_loc = self.returns_df.index.get_loc(first_calc_date) # Get location of first calc date
 
         # Iterate through dates where lookback is available
         for date in self.returns_df.loc[first_calc_date:].index:
-            # Get data slice for lookback ending at current date 't'
             current_loc = self.returns_df.index.get_loc(date)
-            start_loc = current_loc - lookback_window + 1
-            returns_slice = self.returns_df.iloc[start_loc : current_loc + 1]
+            # Check if it's a rebalance month based on frequency
+            months_since_start = current_loc - first_calc_loc
+            if months_since_start % rebalance_freq_months == 0:
+                # Get data slice for lookback ending at current date 't'
+                start_loc = current_loc - lookback_window + 1
+                returns_slice = self.returns_df.iloc[start_loc : current_loc + 1]
 
-            cov_matrix = None
-            cov_calc_successful = False
-            # Calculate annualized covariance matrix (Simple or EWM)
-            try:
-                 # Check for sufficient non-NaN data *before* calculating cov
-                 if returns_slice.dropna().shape[0] < min_lookback_required:
-                     print(f"Warning [{date.date()}]: Insufficient non-NaN data points in lookback window for ERC cov. Skipping.")
-                     continue # Skip this date
-
-                 if use_ewm:
-                     # EWMA covariance calculation
-                     # Ensure min_periods is met for EWM cov calculation
-                     ewm_cov_obj = returns_slice.ewm(
-                         span=lookback_window,
-                         min_periods=lookback_window, # Use full window for stability
-                         adjust=True
-                     )
-                     # Get the covariance matrix for the specific date
-                     # The .cov() method on EWM returns cov matrices for all dates in the window
-                     # We need the one corresponding to the *end* of the window (current date)
-                     cov_matrix_ewm = ewm_cov_obj.cov(pairwise=True) * ANNUALIZATION_FACTOR_COV
-                     if date in cov_matrix_ewm.index.get_level_values(0):
-                          cov_matrix = cov_matrix_ewm.loc[date]
-                     else:
-                          # This might happen if data is sparse at the end
-                          print(f"Warning [{date.date()}]: Could not extract EWM cov matrix for the target date. Skipping.")
-                          continue
-
-                 else:
-                     # Simple moving covariance calculation
-                     cov_matrix = returns_slice.cov(ddof=1) * ANNUALIZATION_FACTOR_COV # Use sample covariance
-
-                 # Validate calculated matrix
-                 if isinstance(cov_matrix, pd.DataFrame) and not cov_matrix.isnull().values.any() and cov_matrix.shape == (self.num_assets, self.num_assets):
-                     cov_calc_successful = True
-                 else:
-                     # Only print warning if matrix calculation yielded invalid result
-                     if cov_matrix is not None:
-                          print(f"Warning [{date.date()}]: Invalid cov matrix ({'EWM' if use_ewm else 'Simple'}). Skipping.")
-
-            except Exception as e:
-                print(f"Error [{date.date()}] calculating cov matrix: {e}. Skipping.")
-                # Consider logging the traceback for debugging
-                # import traceback
-                # traceback.print_exc()
-
-            # Calculate weights only if covariance matrix is valid
-            if cov_calc_successful:
+                cov_matrix = None
+                cov_calc_successful = False
+                # Calculate annualized covariance matrix (Simple or EWM)
                 try:
-                    erc_weights = self._calculate_erc_weights(cov_matrix, date)
-                    weights_dict[date] = erc_weights
+                     # Check for sufficient non-NaN data *before* calculating cov
+                     if returns_slice.dropna().shape[0] < min_lookback_required:
+                         print(f"Warning [{date.date()}]: Insufficient non-NaN data points in lookback window for ERC cov. Skipping rebalance.")
+                         continue # Skip this rebalance date
+
+                     if use_ewm:
+                         ewm_cov_obj = returns_slice.ewm(
+                             span=lookback_window,
+                             min_periods=lookback_window,
+                             adjust=True
+                         )
+                         cov_matrix_ewm = ewm_cov_obj.cov(pairwise=True) * ANNUALIZATION_FACTOR_COV
+                         if date in cov_matrix_ewm.index.get_level_values(0):
+                              cov_matrix = cov_matrix_ewm.loc[date]
+                         else:
+                              print(f"Warning [{date.date()}]: Could not extract EWM cov matrix for the target date. Skipping rebalance.")
+                              continue
+                     else:
+                         cov_matrix = returns_slice.cov(ddof=1) * ANNUALIZATION_FACTOR_COV
+
+                     # Validate calculated matrix
+                     if isinstance(cov_matrix, pd.DataFrame) and not cov_matrix.isnull().values.any() and cov_matrix.shape == (self.num_assets, self.num_assets):
+                         cov_calc_successful = True
+                     else:
+                         if cov_matrix is not None:
+                              print(f"Warning [{date.date()}]: Invalid cov matrix ({'EWM' if use_ewm else 'Simple'}). Skipping rebalance.")
+
                 except Exception as e:
-                    print(f"Error [{date.date()}] calculating ERC weights: {e}. Skipping.")
-                    # import traceback
-                    # traceback.print_exc()
+                    print(f"Error [{date.date()}] calculating cov matrix: {e}. Skipping rebalance.")
+
+                # Calculate weights only if covariance matrix is valid
+                if cov_calc_successful:
+                    try:
+                        erc_weights = self._calculate_erc_weights(cov_matrix, date)
+                        weights_dict[date] = erc_weights # Store weights only for rebalance dates
+                    except Exception as e:
+                        print(f"Error [{date.date()}] calculating ERC weights: {e}. Skipping rebalance.")
 
 
         if not weights_dict:
              print(f"Warning: No weights calculated for {method_name}."); return
 
-        # Create DataFrame and calculate portfolio returns
+        # Create DataFrame (will only contain rows for rebalance dates)
         weights_df = pd.DataFrame.from_dict(weights_dict, orient='index', columns=self.tickers)
-        weights_df.fillna(0, inplace=True) # Fill any gaps if dates were skipped
+        weights_df.fillna(0, inplace=True) # Should not be needed
 
         self._calculate_portfolio_returns(method_name, weights_df)
         print(f"{method_name} construction complete.")
@@ -632,7 +638,10 @@ class PortfolioConstructor:
     # --- End HRP Helper Functions ---
 
 
-    def construct_hrp(self, lookback_years: int = 2, linkage_method: str = 'ward') -> None:
+    def construct_hrp(self,
+                      lookback_years: int = 2,
+                      linkage_method: str = 'ward',
+                      rebalance_freq_months: int = 1) -> None:
         """
         Constructs a Hierarchical Risk Parity (HRP) portfolio.
 
@@ -640,19 +649,24 @@ class PortfolioConstructor:
             lookback_years: Lookback period in years for covariance/correlation calculation.
             linkage_method: The linkage algorithm to use for hierarchical clustering
                             (e.g., 'ward', 'single', 'average', 'complete'). Default is 'ward'.
+            rebalance_freq_months: Frequency (in months) for recalculating weights (e.g., 1 for monthly, 12 for annual).
         """
-        method_name = f"HRP_{linkage_method}"
-        print(f"\nConstructing {method_name} portfolio (Lookback: {lookback_years} years)...")
+        base_method_name = f"HRP_{linkage_method}"
+        # Add frequency to name if not monthly
+        freq_suffix = f"_{rebalance_freq_months}M" if rebalance_freq_months > 1 else ""
+        method_name = f"{base_method_name}{freq_suffix}"
+        print(f"\nConstructing {method_name} portfolio (Lookback: {lookback_years} years, Rebalance: {rebalance_freq_months} months)...")
+
 
         # Validate lookback period
         if lookback_years <= 0: raise ValueError("Lookback years must be positive.")
+        if rebalance_freq_months <= 0: raise ValueError("Rebalance frequency must be positive.")
         lookback_window = int(lookback_years * 12)
         # HRP needs enough data for stable cov/corr, N+1 is minimum for non-singular cov
         min_lookback_required = self.num_assets + 1
         if lookback_window < min_lookback_required:
             # Changed to warning instead of error, but calculation might be unstable
             print(f"Warning: Lookback window ({lookback_window}) is less than recommended ({min_lookback_required}) for HRP.")
-            # raise ValueError(f"Lookback window ({lookback_window}) should generally be >= {min_lookback_required} months for HRP.")
         if lookback_window > len(self.returns_df):
             raise ValueError(f"Lookback window ({lookback_window}) exceeds data length ({len(self.returns_df)}).")
 
@@ -663,85 +677,68 @@ class PortfolioConstructor:
             print(f"Warning: Not enough data for lookback {lookback_window}. Cannot construct {method_name}."); return
 
         first_calc_date = self.returns_df.index[first_calc_date_index]
+        first_calc_loc = self.returns_df.index.get_loc(first_calc_date) # Get location of first calc date
 
         # Iterate through dates where lookback is available
         for date in self.returns_df.loc[first_calc_date:].index:
-            # Get data slice for lookback ending at current date 't'
             current_loc = self.returns_df.index.get_loc(date)
-            start_loc = current_loc - lookback_window + 1
-            returns_slice = self.returns_df.iloc[start_loc : current_loc + 1]
+            # Check if it's a rebalance month based on frequency
+            months_since_start = current_loc - first_calc_loc
+            if months_since_start % rebalance_freq_months == 0:
+                # Get data slice for lookback ending at current date 't'
+                start_loc = current_loc - lookback_window + 1
+                returns_slice = self.returns_df.iloc[start_loc : current_loc + 1]
 
-            # Calculate NON-ANNUALIZED Covariance and Correlation for HRP internals
-            cov_matrix = None
-            corr_matrix = None
-            matrices_calculated = False
-            try:
-                # Check for sufficient non-NaN data points per asset in the slice
-                # Use shape[0] of dropna() to count valid rows
-                if returns_slice.dropna().shape[0] < min_lookback_required:
-                     print(f"Warning [{date.date()}]: Insufficient non-NaN data points ({returns_slice.dropna().shape[0]} < {min_lookback_required}) in lookback window. Skipping HRP.")
-                     continue # Skip to next date
-
-                # Calculate matrices using sample statistics (ddof=1)
-                cov_matrix = returns_slice.cov(ddof=1)
-                corr_matrix = returns_slice.corr()
-
-                # Basic validation
-                if (isinstance(cov_matrix, pd.DataFrame) and not cov_matrix.isnull().values.any() and
-                    isinstance(corr_matrix, pd.DataFrame) and not corr_matrix.isnull().values.any() and
-                    cov_matrix.shape == (self.num_assets, self.num_assets) and
-                    corr_matrix.shape == (self.num_assets, self.num_assets)):
-                    matrices_calculated = True
-                else:
-                    print(f"Warning [{date.date()}]: Invalid cov or corr matrix calculated (NaNs or shape mismatch). Skipping HRP.")
-
-            except Exception as e:
-                print(f"Error [{date.date()}] calculating cov/corr matrix: {e}. Skipping HRP.")
-
-            # Proceed only if matrices are valid
-            if matrices_calculated:
+                # Calculate NON-ANNUALIZED Covariance and Correlation for HRP internals
+                cov_matrix = None
+                corr_matrix = None
+                matrices_calculated = False
                 try:
-                    # --- HRP Steps ---
-                    # 1. Calculate condensed distance matrix from correlation
-                    dist_condensed = self._correlDist(corr_matrix)
+                    # Check for sufficient non-NaN data points per asset in the slice
+                    if returns_slice.dropna().shape[0] < min_lookback_required:
+                         print(f"Warning [{date.date()}]: Insufficient non-NaN data points ({returns_slice.dropna().shape[0]} < {min_lookback_required}) in lookback window. Skipping HRP rebalance.")
+                         continue # Skip this rebalance date
 
-                    # 2. Perform hierarchical clustering
-                    link = sch.linkage(dist_condensed, method=linkage_method)
+                    # Calculate matrices using sample statistics (ddof=1)
+                    cov_matrix = returns_slice.cov(ddof=1)
+                    corr_matrix = returns_slice.corr()
 
-                    # 3. Get quasi-diagonal order (original asset indices 0..N-1)
-                    sortIx_indices = self._getQuasiDiag(link)
-                    # Map indices back to original ticker labels using the cov_matrix index order
-                    sortIx_tickers = cov_matrix.index[sortIx_indices].tolist()
-
-                    # 4. Reorder the original covariance matrix according to cluster order
-                    cov_matrix_sorted = cov_matrix.loc[sortIx_tickers, sortIx_tickers]
-
-                    # 5. Recursive Bisection and Weight Allocation
-                    hrp_weights_sorted = self._getRecBipart(cov_matrix_sorted, sortIx_tickers)
-
-                    # 6. Reorder weights back to original asset order (self.tickers)
-                    # Use .loc for safety if self.tickers might not match index exactly
-                    hrp_weights = hrp_weights_sorted.reindex(self.tickers).fillna(0)
-
-                    # Final check/renormalization (should be close to 1 already)
-                    hrp_weights /= (hrp_weights.sum() + FLOAT_COMPARISON_THRESHOLD)
-
-                    weights_dict[date] = hrp_weights
-                    # --- End HRP Steps ---
+                    # Basic validation
+                    if (isinstance(cov_matrix, pd.DataFrame) and not cov_matrix.isnull().values.any() and
+                        isinstance(corr_matrix, pd.DataFrame) and not corr_matrix.isnull().values.any() and
+                        cov_matrix.shape == (self.num_assets, self.num_assets) and
+                        corr_matrix.shape == (self.num_assets, self.num_assets)):
+                        matrices_calculated = True
+                    else:
+                        print(f"Warning [{date.date()}]: Invalid cov or corr matrix calculated (NaNs or shape mismatch). Skipping HRP rebalance.")
 
                 except Exception as e:
-                    print(f"Error [{date.date()}] during HRP calculation steps: {e}. Skipping.")
-                    # import traceback # Optional detailed debugging
-                    # traceback.print_exc()
+                    print(f"Error [{date.date()}] calculating cov/corr matrix: {e}. Skipping HRP rebalance.")
+
+                # Proceed only if matrices are valid
+                if matrices_calculated:
+                    try:
+                        # --- HRP Steps ---
+                        dist_condensed = self._correlDist(corr_matrix)
+                        link = sch.linkage(dist_condensed, method=linkage_method)
+                        sortIx_indices = self._getQuasiDiag(link)
+                        sortIx_tickers = cov_matrix.index[sortIx_indices].tolist()
+                        cov_matrix_sorted = cov_matrix.loc[sortIx_tickers, sortIx_tickers]
+                        hrp_weights_sorted = self._getRecBipart(cov_matrix_sorted, sortIx_tickers)
+                        hrp_weights = hrp_weights_sorted.reindex(self.tickers).fillna(0)
+                        hrp_weights /= (hrp_weights.sum() + FLOAT_COMPARISON_THRESHOLD)
+                        weights_dict[date] = hrp_weights # Store weights only for rebalance dates
+                        # --- End HRP Steps ---
+                    except Exception as e:
+                        print(f"Error [{date.date()}] during HRP calculation steps: {e}. Skipping rebalance.")
 
 
         if not weights_dict:
             print(f"Warning: No weights calculated for {method_name}."); return
 
-        # Create DataFrame and calculate portfolio returns
+        # Create DataFrame (will only contain rows for rebalance dates)
         weights_df = pd.DataFrame.from_dict(weights_dict, orient='index', columns=self.tickers)
-        # Fill potential NaNs resulting from skipped dates etc.
-        weights_df.fillna(0, inplace=True)
+        weights_df.fillna(0, inplace=True) # Should not be needed
 
         self._calculate_portfolio_returns(method_name, weights_df)
         print(f"{method_name} construction complete.")
@@ -750,8 +747,6 @@ class PortfolioConstructor:
     def get_returns(self) -> pd.DataFrame:
         """Returns DataFrame of monthly returns for all constructed portfolios."""
         if not self.returns: print("Warning: No portfolio returns calculated."); return pd.DataFrame()
-        # Ensure consistent frequency if needed, though should be monthly
-        # return pd.DataFrame(self.returns).resample('M').last() # Example if needed
         return pd.DataFrame(self.returns)
 
     def get_weights(self, method_name: str) -> pd.DataFrame:
@@ -759,10 +754,11 @@ class PortfolioConstructor:
         Returns DataFrame of portfolio weights for a specific method.
 
         Args:
-            method_name: The name of the method (e.g., 'EW', 'ERC_EWM', 'HRP_ward').
+            method_name: The name of the method (e.g., 'EW', 'ERC_EWM', 'HRP_ward_12M').
 
         Returns:
-            DataFrame of weights (index=Date, columns=Tickers).
+            DataFrame of weights (index=Date, columns=Tickers). These are the
+            effective weights used in the return calculation (i.e., shifted and ffilled).
 
         Raises:
             KeyError: If the method name is not found.
@@ -771,6 +767,49 @@ class PortfolioConstructor:
             available = list(self.weights.keys())
             raise KeyError(f"Weights for '{method_name}' not found. Available: {available}")
         return self.weights[method_name]
+
+    def get_raw_weights(self, method_name: str) -> Optional[pd.DataFrame]:
+        """
+        EXPERIMENTAL: Attempts to retrieve the raw, unshifted, non-ffilled weights
+        as calculated by the construction method *on rebalance dates only*.
+
+        Note: This relies on reconstructing from the `weights_dict` used internally,
+              which is not a standard attribute. Use with caution. Returns None if
+              the method doesn't use a weights_dict or calculation failed.
+
+        Args:
+            method_name: The name of the method (e.g., 'ERC_EWM_12M').
+
+        Returns:
+            Optional[pd.DataFrame]: DataFrame of raw weights indexed by rebalance date,
+                                    or None if not applicable/available.
+        """
+        # This is a simplified example; a robust implementation would require
+        # storing the raw weights_dict explicitly during construction.
+        # For demonstration, we assume the method name implies the parameters.
+        print(f"\nAttempting to retrieve raw weights for {method_name} (Experimental)...")
+        temp_weights_dict = {}
+        params = method_name.split('_')
+        base_method = params[0]
+
+        # --- This part needs actual implementation based on stored raw weights ---
+        # --- The current code doesn't store the raw dicts persistently ---
+        # --- We would need to modify the construct methods to store them ---
+        # Example placeholder:
+        if method_name in self.weights: # Check if effective weights exist
+             print("Warning: Returning effective weights. Raw weights retrieval not fully implemented.")
+             # Find the dates where weights actually changed significantly (proxy for rebalance)
+             eff_weights = self.weights[method_name]
+             # Check where weights differ from the previous row (ignoring first row)
+             diff_check = eff_weights.diff().abs().sum(axis=1) > FLOAT_COMPARISON_THRESHOLD
+             diff_check.iloc[0] = True # Always include the first date
+             raw_weights_approx = eff_weights[diff_check]
+             return raw_weights_approx
+        else:
+             print(f"Raw weights not available for {method_name}.")
+             return None
+        # --- End Placeholder ---
+
 
     def get_total_return_indexes(self, base_value: int = 100) -> pd.DataFrame:
         """
@@ -856,8 +895,9 @@ class PortfolioAnalyzer:
 
         # Combine all returns; handle potential duplicate column names if assets included in portfolios
         self.all_returns = pd.concat([portfolio_returns, asset_returns], axis=1)
-        # Optional: Add suffixes if asset names might collide with portfolio names
-        # self.all_returns = pd.concat([portfolio_returns, asset_returns.add_suffix('_Asset')], axis=1)
+        # Drop duplicate columns (e.g., if an asset return was passed in both inputs)
+        self.all_returns = self.all_returns.loc[:,~self.all_returns.columns.duplicated()]
+
 
         # Drop columns that are entirely NaN
         self.all_returns.dropna(axis=1, how='all', inplace=True)
@@ -920,9 +960,9 @@ class PortfolioAnalyzer:
             effective_returns = returns_series.iloc[:first_loss_idx]
             if effective_returns.empty: return -1.0 # Should not happen if first_loss_idx > 0
             num_effective_months = len(effective_returns)
+            # Avoid division by zero if num_effective_months is 0
+            if num_effective_months == 0: return -1.0
             return ((1 + effective_returns).prod())**(12.0 / num_effective_months) - 1
-            # Alternatively, just return NaN or -1.0 if any period is <= -1
-            # return -1.0 # Or np.nan
 
         # Standard calculation
         return ((1 + returns_series).prod())**(12.0 / num_months) - 1
@@ -967,7 +1007,9 @@ class PortfolioAnalyzer:
         except TypeError:
              base_idx = returns_series.index[0] - pd.Timedelta(days=30) # Approximation
 
-        tri.loc[base_idx] = 1.0
+        # Use pd.concat instead of .loc to avoid potential SettingWithCopyWarning
+        base_row = pd.Series([1.0], index=[base_idx])
+        tri = pd.concat([base_row, tri])
         tri.sort_index(inplace=True)
 
 
@@ -991,6 +1033,7 @@ class PortfolioAnalyzer:
 
         # Get the first index where the peak value (rolling_max at trough date) was achieved
         peak_value_at_trough = peak_candidates.iloc[-1]
+        # Find first occurrence of the peak value before or at the trough
         peak_date = peak_candidates[peak_candidates >= peak_value_at_trough - FLOAT_COMPARISON_THRESHOLD].index[0]
         peak_value = tri.loc[peak_date]
 
@@ -1013,11 +1056,12 @@ class PortfolioAnalyzer:
                      recovery_loc_in_returns = returns_series.index.get_loc(recovery_date)
                      # Duration is number of periods from peak *start* to recovery *end*
                      # If peak was before returns_series start (base index), start count from 0
-                     start_loc = max(0, peak_loc_in_returns)
+                     # Add 1 because duration includes start and end month? No, difference is correct.
+                     start_loc = max(0, peak_loc_in_returns) if peak_loc_in_returns != -1 else 0
                      duration_months = float(recovery_loc_in_returns - start_loc)
 
                 except KeyError:
-                     # Fallback if dates don't align perfectly, use integer difference
+                     # Fallback if dates don't align perfectly, use integer difference in TRI index
                      peak_loc = tri.index.get_loc(peak_date)
                      recovery_loc = tri.index.get_loc(recovery_date)
                      duration_months = float(recovery_loc - peak_loc) # Number of periods in TRI index
@@ -1160,7 +1204,12 @@ class PortfolioAnalyzer:
                 if pd.notnull(x) and np.isfinite(x):
                     return f"{int(x):,d}"
                 elif pd.isnull(x):
-                    return "Ongoing" # If recovery is NaN, it means not recovered yet
+                    # Check if max_dd was 0, if so, recovery is 0, otherwise ongoing
+                    # Need original max_dd value here... This formatting makes assumptions.
+                    # Let's adjust: Format NaN as "Ongoing" only if MaxDD was < 0
+                    # This requires passing the unformatted df, making it complex here.
+                    # Simpler: Treat NaN recovery as "Ongoing" for now.
+                    return "Ongoing"
                 else: # Handles potential -inf/inf if calculation goes wrong
                     return "-"
 
@@ -1353,19 +1402,28 @@ if __name__ == "__main__":
         # Initialize the constructor with the TRI data
         constructor = PortfolioConstructor(tri_df=sim_tri)
 
-        # Run different portfolio construction methods
-        constructor.construct_equal_weight()
-        constructor.construct_equal_volatility(lookback_years=3) # Use 3 years
-        constructor.construct_erc(lookback_years=3, use_ewm=True) # 3yr EWM ERC
-        constructor.construct_erc(lookback_years=3, use_ewm=False) # 3yr Simple ERC
-        constructor.construct_hrp(lookback_years=3, linkage_method='ward') # 3yr HRP Ward
-        constructor.construct_hrp(lookback_years=3, linkage_method='single') # 3yr HRP Single
+        # --- Run different portfolio construction methods ---
+
+        # Monthly Rebalancing (Default)
+        constructor.construct_equal_weight() # EW is always monthly implicitly
+        constructor.construct_equal_volatility(lookback_years=3, rebalance_freq_months=1)
+        constructor.construct_erc(lookback_years=3, use_ewm=True, rebalance_freq_months=1)
+        constructor.construct_erc(lookback_years=3, use_ewm=False, rebalance_freq_months=1)
+        constructor.construct_hrp(lookback_years=3, linkage_method='ward', rebalance_freq_months=1)
+        constructor.construct_hrp(lookback_years=3, linkage_method='single', rebalance_freq_months=1)
+
+        # Annual Rebalancing (Recalculate weights every 12 months)
+        constructor.construct_equal_volatility(lookback_years=3, rebalance_freq_months=12)
+        constructor.construct_erc(lookback_years=3, use_ewm=True, rebalance_freq_months=12)
+        constructor.construct_erc(lookback_years=3, use_ewm=False, rebalance_freq_months=12)
+        constructor.construct_hrp(lookback_years=3, linkage_method='ward', rebalance_freq_months=12)
+        constructor.construct_hrp(lookback_years=3, linkage_method='single', rebalance_freq_months=12)
 
 
         print("\n--- Generating Final Report ---")
         # Define analysis periods and output filename
         analysis_periods_config = [1, 3, 5, 10]
-        output_file = "portfolio_analysis_report_with_hrp.xlsx"
+        output_file = "portfolio_analysis_report_rebal_freq.xlsx"
 
         # Generate the multi-sheet Excel report
         generate_portfolio_report(
@@ -1390,3 +1448,4 @@ if __name__ == "__main__":
          traceback.print_exc()
          # Optionally, re-raise the exception if debugging is needed
          # raise e
+
